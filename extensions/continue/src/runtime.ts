@@ -17,6 +17,7 @@ import type {
 	ContinuationResumeStatus,
 	ContinuationTurnProvenance,
 	MidRunGuardTrigger,
+	StallRecoveryTurnOutcome,
 } from "./types.ts";
 import {
 	clearPendingResumeDispatch,
@@ -26,6 +27,7 @@ import {
 	preparePendingResumeDispatch,
 	type ResumeProofRuntimeState,
 } from "./resume-proof.ts";
+import { createStallRecoveryTurnOutcome } from "./stall-recovery.ts";
 import {
 	beginWorkingVisuals,
 	settleWorkingVisuals,
@@ -40,6 +42,10 @@ export type ContinuationRequestSource = ContinuationEventSource;
 export interface ContinuationRuntimeState extends ResumeProofRuntimeState, ContinuationTurnProvenance {
 	latestLedger: ContinuationLedgerSnapshot | undefined;
 	lastNoCompactableGuardKey: string | undefined;
+	turnOutcome: StallRecoveryTurnOutcome;
+	stallRecoveryAttempts: number;
+	/** Monotonic counter of human inputs, used to abandon work the human already superseded. */
+	inputSequence: number;
 }
 
 export interface ContinuationRequest {
@@ -112,7 +118,9 @@ export function createContinuationRuntimeState(): ContinuationRuntimeState {
 		latestLedger: undefined,
 		lastNoCompactableGuardKey: undefined,
 		adoptionCheckpoint: undefined,
-		lastAssistantStopReason: undefined,
+		turnOutcome: createStallRecoveryTurnOutcome(),
+		stallRecoveryAttempts: 0,
+		inputSequence: 0,
 		latestEvent: undefined,
 		activeEventId: undefined,
 		nextEventSequence: 0,
@@ -325,14 +333,45 @@ export function startContinuationCompaction(
 	return true;
 }
 
-/** Record the stop reason of the assistant response that just finished. */
-export function recordAssistantStopReason(runtime: ContinuationRuntimeState, stopReason: string | undefined): void {
-	runtime.lastAssistantStopReason = stopReason;
+/** Record what the assistant response contributed to the current turn. */
+export function recordAssistantTurnOutcome(
+	runtime: ContinuationRuntimeState,
+	outcome: { stopReason: string | undefined; errorMessage: string | undefined; deliveredAnswer: boolean },
+): void {
+	// The last assistant response decides how the turn ended, so this replaces rather
+	// than accumulates: text written before an interrupted tail is not a delivered answer.
+	runtime.turnOutcome = {
+		assistantStopReason: outcome.stopReason,
+		assistantErrorMessage: outcome.errorMessage,
+		deliveredAnswer: outcome.deliveredAnswer,
+	};
 }
 
-/** Open the single adoptable checkpoint for the assistant turn that just ended. */
+/** Start tracking a new turn; the previous turn's outcome no longer applies. */
+export function beginContinuationTurn(runtime: ContinuationRuntimeState): void {
+	runtime.turnOutcome = createStallRecoveryTurnOutcome();
+}
+
+/** Forget how many nudges were needed once the run makes progress or the human takes over. */
+export function resetStallRecoveryAttempts(runtime: ContinuationRuntimeState): void {
+	runtime.stallRecoveryAttempts = 0;
+}
+
+/** Record that the human took over: pending automatic work for the previous turn is abandoned. */
+export function noteContinuationUserInput(runtime: ContinuationRuntimeState): void {
+	runtime.inputSequence += 1;
+	clearContinuationAdoptionCheckpoint(runtime);
+	resetStallRecoveryAttempts(runtime);
+}
+
+/**
+ * Open the single adoptable checkpoint for the assistant turn that just ended.
+ *
+ * The stop reason comes from this turn only: a turn that produced no assistant
+ * response opens a checkpoint no compaction can adopt.
+ */
 export function openContinuationAdoptionCheckpoint(runtime: ContinuationRuntimeState): void {
-	runtime.adoptionCheckpoint = { stopReason: runtime.lastAssistantStopReason, openedAt: Date.now() };
+	runtime.adoptionCheckpoint = { stopReason: runtime.turnOutcome.assistantStopReason, openedAt: Date.now() };
 }
 
 /** Close the checkpoint because new user input or a new turn owns what happens next. */

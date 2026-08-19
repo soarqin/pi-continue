@@ -51,6 +51,8 @@ export const DEFAULT_CONTINUE_CONFIG: ContinuationConfig = {
 	agentGuideSyncMode: "off",
 	midRunGuardEnabled: true,
 	adoptNativeCompaction: true,
+	stallRecoveryEnabled: true,
+	stallRecoveryMaxAttempts: 3,
 	appendCompactionMetadata: false,
 	appendReadFileTags: false,
 	appendModifiedFileTags: true,
@@ -69,6 +71,8 @@ interface PartialContinuationConfig {
 	agentGuideSyncMode?: string;
 	midRunGuardEnabled?: boolean;
 	adoptNativeCompaction?: boolean;
+	stallRecoveryEnabled?: boolean;
+	stallRecoveryMaxAttempts?: number;
 	appendCompactionMetadata?: boolean;
 	appendReadFileTags?: boolean;
 	appendModifiedFileTags?: boolean;
@@ -87,6 +91,8 @@ export interface ContinuationConfigPatch {
 	agentGuideSyncMode?: WriteMode;
 	midRunGuardEnabled?: boolean;
 	adoptNativeCompaction?: boolean;
+	stallRecoveryEnabled?: boolean;
+	stallRecoveryMaxAttempts?: number;
 	appendCompactionMetadata?: boolean;
 	appendReadFileTags?: boolean;
 	appendModifiedFileTags?: boolean;
@@ -138,6 +144,10 @@ function parsePartialConfig(value: unknown): PartialContinuationConfig {
 	if (midRunGuardEnabled !== undefined) result.midRunGuardEnabled = midRunGuardEnabled;
 	const adoptNativeCompaction = asBoolean(value.adoptNativeCompaction);
 	if (adoptNativeCompaction !== undefined) result.adoptNativeCompaction = adoptNativeCompaction;
+	const stallRecoveryEnabled = asBoolean(value.stallRecoveryEnabled);
+	if (stallRecoveryEnabled !== undefined) result.stallRecoveryEnabled = stallRecoveryEnabled;
+	const stallRecoveryMaxAttempts = asNumber(value.stallRecoveryMaxAttempts);
+	if (stallRecoveryMaxAttempts !== undefined) result.stallRecoveryMaxAttempts = stallRecoveryMaxAttempts;
 	const appendCompactionMetadata = asBoolean(value.appendCompactionMetadata);
 	if (appendCompactionMetadata !== undefined) result.appendCompactionMetadata = appendCompactionMetadata;
 	const appendReadFileTags = asBoolean(value.appendReadFileTags);
@@ -193,6 +203,12 @@ function normalizeTokenOverride(value: number | null | undefined): number | null
 	return rounded > 0 ? rounded : null;
 }
 
+function normalizeAttempts(value: number | undefined): number {
+	if (value === undefined) return DEFAULT_CONTINUE_CONFIG.stallRecoveryMaxAttempts;
+	const rounded = Math.round(value);
+	return rounded >= 0 ? rounded : DEFAULT_CONTINUE_CONFIG.stallRecoveryMaxAttempts;
+}
+
 function normalizeSummarizerModel(value: string | undefined): string {
 	const trimmed = value?.trim();
 	return trimmed && trimmed.length > 0 ? trimmed : DEFAULT_CONTINUE_CONFIG.summarizerModel;
@@ -210,6 +226,8 @@ function normalizeConfig(partial: PartialContinuationConfig): ContinuationConfig
 		agentGuideSyncMode: normalizeWriteMode(partial.agentGuideSyncMode, DEFAULT_CONTINUE_CONFIG.agentGuideSyncMode),
 		midRunGuardEnabled: partial.midRunGuardEnabled ?? DEFAULT_CONTINUE_CONFIG.midRunGuardEnabled,
 		adoptNativeCompaction: partial.adoptNativeCompaction ?? DEFAULT_CONTINUE_CONFIG.adoptNativeCompaction,
+		stallRecoveryEnabled: partial.stallRecoveryEnabled ?? DEFAULT_CONTINUE_CONFIG.stallRecoveryEnabled,
+		stallRecoveryMaxAttempts: normalizeAttempts(partial.stallRecoveryMaxAttempts),
 		appendCompactionMetadata: partial.appendCompactionMetadata ?? DEFAULT_CONTINUE_CONFIG.appendCompactionMetadata,
 		appendReadFileTags: partial.appendReadFileTags ?? DEFAULT_CONTINUE_CONFIG.appendReadFileTags,
 		appendModifiedFileTags: partial.appendModifiedFileTags ?? DEFAULT_CONTINUE_CONFIG.appendModifiedFileTags,

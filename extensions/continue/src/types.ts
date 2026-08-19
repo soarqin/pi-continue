@@ -19,6 +19,8 @@ export interface ContinuationConfig {
 	agentGuideSyncMode: WriteMode;
 	midRunGuardEnabled: boolean;
 	adoptNativeCompaction: boolean;
+	stallRecoveryEnabled: boolean;
+	stallRecoveryMaxAttempts: number;
 	appendCompactionMetadata: boolean;
 	appendReadFileTags: boolean;
 	appendModifiedFileTags: boolean;
@@ -243,6 +245,18 @@ export interface ContextUsageEstimateSnapshot {
 	lastUsageIndex: number | null;
 }
 
+/** What the current agent turn produced, used to tell a finished answer from an interrupted turn. */
+export interface StallRecoveryTurnOutcome {
+	assistantStopReason: string | undefined;
+	assistantErrorMessage: string | undefined;
+	deliveredAnswer: boolean;
+}
+
+export type StallRecoveryDecision =
+	| { action: "resume"; reason: string }
+	| { action: "stop"; reason: string }
+	| { action: "settled"; reason: string };
+
 /** One adoptable checkpoint opened by an assistant turn that ended on its own. */
 export interface ContinuationAdoptionCheckpoint {
 	stopReason: string | undefined;
@@ -258,7 +272,6 @@ export interface ContinuationAdoptionCheckpoint {
  */
 export interface ContinuationTurnProvenance {
 	adoptionCheckpoint: ContinuationAdoptionCheckpoint | undefined;
-	lastAssistantStopReason: string | undefined;
 }
 
 export interface MidRunGuardTrigger {

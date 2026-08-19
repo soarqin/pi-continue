@@ -23,10 +23,12 @@ import {
 } from "./src/continuation-event.ts";
 import { buildContinuationDetails, buildContinuationSynthesisTelemetry, combinePromptPassAttempts, parseContinuationDetails } from "./src/details.ts";
 import { describeSynthesisAbort } from "./src/synthesis-error.ts";
+import { STALL_RECOVERY_PROMPT, decideStallRecovery } from "./src/stall-recovery.ts";
 import { buildLedgerSnapshot, createContinuationLedgerOverlayController } from "./src/ledger-viewer.ts";
 import { decideAdoptedCompactionTrigger, runMidRunGuard } from "./src/mid-run-guard.ts";
 import { PromptPassError, runPromptPass } from "./src/model.ts";
 import { loadPiInternals } from "./src/pi-internals.ts";
+import { readEffectivePiCompactionSettings } from "./src/pi-settings.ts";
 import { compileHistoryPrompt, withArtifactRepairReminder } from "./src/prompt.ts";
 import { resolveProjectContext, writeNormalizedMarkdownFile } from "./src/project.ts";
 import { isContinuationPromptUserMessage, sendContinuationPrompt } from "./src/prompt-dispatch.ts";
@@ -38,14 +40,17 @@ import {
 	createContinuationRuntimeState,
 	dispatchVerifiedContinuationResume,
 	failContinuationCompactionProof,
+	beginContinuationTurn,
 	clearContinuationAdoptionCheckpoint,
 	consumeContinuationAdoptionCheckpoint,
 	failRunningAwaitingContinuationResume,
 	markAwaitingContinuationResumeStarted,
 	markContinuationCompactionComplete,
+	noteContinuationUserInput,
 	openContinuationAdoptionCheckpoint,
-	recordAssistantStopReason,
+	recordAssistantTurnOutcome,
 	releaseAdoptedContinuationCompaction,
+	resetStallRecoveryAttempts,
 	settleAwaitingContinuationResumeFromAssistant,
 	startAdoptedContinuationCompaction,
 	type ContinuationRuntimeState,
@@ -56,7 +61,7 @@ import {
 	NATIVE_COMPACTION_FALLBACK_FAILURE,
 	clearPendingResumeDispatch,
 } from "./src/resume-proof.ts";
-import type { AgentGuideWriteStatus, ContinuationSynthesisFailure, ContinuationSynthesisTelemetry, ParsedHistoryArtifacts, PendingOutputWrite, PromptPassTelemetry, WriteMode } from "./src/types.ts";
+import type { AgentGuideWriteStatus, ContinuationSynthesisFailure, ContinuationSynthesisTelemetry, ParsedHistoryArtifacts, PendingOutputWrite, PromptPassTelemetry, StallRecoveryDecision, WriteMode } from "./src/types.ts";
 import {
 	clearWorkingVisuals,
 	settleWorkingVisuals,
@@ -70,6 +75,10 @@ function decideAgentGuideWriteStatus(writeMode: WriteMode, agentGuideMd: string 
 
 function isAssistantMessage(message: unknown): message is AssistantMessage {
 	return typeof message === "object" && message !== null && "role" in message && message.role === "assistant";
+}
+
+function hasDeliveredAnswer(message: AssistantMessage): boolean {
+	return message.content.some((block) => block.type === "text" && block.text.trim().length > 0);
 }
 
 const OUTPUT_WRITE_FAILURE = "Output write failed; check the configured path and permissions.";
@@ -162,6 +171,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("before_agent_start", async (event, ctx) => {
 		// A new turn owns what happens next, so the previous checkpoint is no longer adoptable.
 		clearContinuationAdoptionCheckpoint(runtime);
+		beginContinuationTurn(runtime);
 		if (event.prompt !== CONTINUATION_PROMPT) return;
 		const eventId = markAwaitingContinuationResumeStarted(runtime);
 		if (!eventId) return;
@@ -183,10 +193,91 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("input", async (_event, _ctx) => {
-		// New user input means the next compaction belongs to that submission, not to a
-		// finished assistant turn, so it must not be adopted as an automatic checkpoint.
-		clearContinuationAdoptionCheckpoint(runtime);
+		// The human is driving again: the next compaction belongs to that submission rather
+		// than to a finished turn, and earlier stall nudges no longer count against the budget.
+		noteContinuationUserInput(runtime);
 	});
+
+	function isOverCompactionThreshold(ctx: ExtensionContext, projectRoot: string): boolean {
+		const piSettings = readEffectivePiCompactionSettings(projectRoot);
+		if (!piSettings.enabled) return false;
+		const usage = ctx.getContextUsage();
+		const usedTokens = usage?.tokens;
+		if (usedTokens === null || usedTokens === undefined || !Number.isFinite(usedTokens)) return false;
+		const contextWindow = ctx.model?.contextWindow ?? usage?.contextWindow;
+		if (!contextWindow || !Number.isFinite(contextWindow) || contextWindow <= piSettings.reserveTokens) return false;
+		return usedTokens > contextWindow - piSettings.reserveTokens;
+	}
+
+	/**
+	 * Restart a turn that stopped without finishing the work.
+	 *
+	 * Pi ends the run silently when a request fails in a way it cannot retry, which
+	 * leaves the task half-done with no visible error. Only failures a nudge cannot fix
+	 * stop the run for good.
+	 */
+	function stallRecoveryOwnedElsewhere(): boolean {
+		// A pending handoff or resume already owns what happens next.
+		return getActiveContinuationEventId(runtime) !== undefined
+			|| runtime.awaitingResumeEventId !== undefined
+			|| runtime.compactionRunning;
+	}
+
+	async function recoverStalledTurn(ctx: ExtensionContext): Promise<void> {
+		if (stallRecoveryInFlight || stallRecoveryOwnedElsewhere()) return;
+		const decision = decideStallRecovery(runtime.turnOutcome);
+		if (decision.action === "settled") {
+			resetStallRecoveryAttempts(runtime);
+			return;
+		}
+		stallRecoveryInFlight = true;
+		try {
+			await sendStallRecoveryPrompt(ctx, decision);
+		} finally {
+			stallRecoveryInFlight = false;
+		}
+	}
+
+	async function sendStallRecoveryPrompt(ctx: ExtensionContext, decision: StallRecoveryDecision): Promise<void> {
+		const inputSequenceAtStart = runtime.inputSequence;
+		const projectContext = await resolveProjectContext(pi, ctx.cwd, ctx.sessionManager.getSessionId());
+		const config = loadContinuationConfig(projectContext.projectRoot);
+		if (!config.enabled || !config.stallRecoveryEnabled) return;
+		// The human or a continuation handoff may have taken over while the config resolved.
+		if (runtime.inputSequence !== inputSequenceAtStart || stallRecoveryOwnedElsewhere()) return;
+		if (decision.action !== "resume") {
+			resetStallRecoveryAttempts(runtime);
+			if (ctx.hasUI) ctx.ui.notify(`pi-continue did not resume: ${decision.reason}.`, "warning");
+			return;
+		}
+		// An over-threshold context is about to be compacted, and that handoff sends its own
+		// resume request. Nudging here would queue a second prompt for the same work.
+		if (isOverCompactionThreshold(ctx, projectContext.projectRoot)) return;
+		// Queued human messages drive the next turn themselves.
+		if (ctx.hasPendingMessages()) return;
+		if (runtime.stallRecoveryAttempts >= config.stallRecoveryMaxAttempts) {
+			if (ctx.hasUI) {
+				ctx.ui.notify(
+					`pi-continue stopped resuming after ${runtime.stallRecoveryAttempts} attempts; ${decision.reason}.`,
+					"warning",
+				);
+			}
+			return;
+		}
+		runtime.stallRecoveryAttempts += 1;
+		try {
+			sendContinuationPrompt(pi, STALL_RECOVERY_PROMPT);
+		} catch {
+			if (ctx.hasUI) ctx.ui.notify("pi-continue could not send the resume request for the interrupted turn.", "error");
+			return;
+		}
+		if (ctx.hasUI) {
+			ctx.ui.notify(
+				`pi-continue resumed an interrupted turn (${runtime.stallRecoveryAttempts}/${config.stallRecoveryMaxAttempts}): ${decision.reason}.`,
+				"info",
+			);
+		}
+	}
 
 	pi.on("agent_end", async (_event, ctx) => {
 		openContinuationAdoptionCheckpoint(runtime);
@@ -196,11 +287,16 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 		armDeferredResumeStartTimeout(ctx, runtime);
+		await recoverStalledTurn(ctx);
 	});
 
 	pi.on("message_end", async (event, ctx) => {
 		if (!isAssistantMessage(event.message)) return;
-		recordAssistantStopReason(runtime, event.message.stopReason);
+		recordAssistantTurnOutcome(runtime, {
+			stopReason: event.message.stopReason,
+			errorMessage: event.message.errorMessage,
+			deliveredAnswer: hasDeliveredAnswer(event.message),
+		});
 		const settlement = settleAwaitingContinuationResumeFromAssistant(runtime, event.message);
 		if (!settlement) return;
 		settleWorkingVisuals(ctx, runtime, settlement.eventId);
@@ -408,6 +504,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	let compactionHandoffInFlight = false;
+	let stallRecoveryInFlight = false;
 
 	pi.on("session_before_compact", async (event, ctx) => {
 		// One compaction at a time: a second operation entering while a handoff is being

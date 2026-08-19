@@ -7,6 +7,7 @@ import { join } from "node:path";
 import registerContinueExtension from "../extensions/continue/index.ts";
 import { buildContinuationArtifactPath } from "../extensions/continue/src/project.ts";
 import { CONTINUATION_PROMPT } from "../extensions/continue/src/runtime.ts";
+import { STALL_RECOVERY_PROMPT } from "../extensions/continue/src/stall-recovery.ts";
 import { NO_PRE_COMPACTION_MESSAGES_KEPT_ENTRY_ID } from "../extensions/continue/src/compaction-preparation.ts";
 
 function assistantMessage(stopReason = "stop") {
@@ -153,6 +154,9 @@ function createCommandContext(cwd, custom) {
 		},
 		isIdle() {
 			return true;
+		},
+		hasPendingMessages() {
+			return false;
 		},
 		abort() {},
 		compact(options) {
@@ -925,6 +929,118 @@ async function completeAssistantTurn(pi, ctx) {
 	await pi.events.get("agent_end")({ messages: [] }, ctx);
 }
 
+function interruptedAssistantMessage(overrides = {}) {
+	return { ...assistantMessage("error"), content: [], errorMessage: "socket hang up", ...overrides };
+}
+
+async function endInterruptedTurn(pi, ctx, message = interruptedAssistantMessage()) {
+	await pi.events.get("before_agent_start")({ prompt: "do the work" }, ctx);
+	await pi.events.get("message_end")({ message }, ctx);
+	await pi.events.get("agent_end")({ messages: [] }, ctx);
+}
+
+test("an interrupted turn is resumed until the run makes progress", async () => {
+	const cwd = mkdtempSync(join(tmpdir(), "pi-continue-stall-"));
+	try {
+		const pi = createFakePi(cwd);
+		const notifications = [];
+		const ctx = createCommandContext(cwd, async () => undefined);
+		ctx.ui.notify = (message, type) => {
+			notifications.push([message, type]);
+		};
+		registerContinueExtension(pi);
+
+		await endInterruptedTurn(pi, ctx);
+		assert.deepEqual(pi.sent, [STALL_RECOVERY_PROMPT]);
+		assert.match(notifications.at(-1)[0], /resumed an interrupted turn \(1\/3\): the turn ended on a provider error/);
+
+		// An empty assistant response is the silent stop this recovers from.
+		await endInterruptedTurn(pi, ctx, { ...assistantMessage(), content: [] });
+		assert.deepEqual(pi.sent, [STALL_RECOVERY_PROMPT, STALL_RECOVERY_PROMPT]);
+		assert.match(notifications.at(-1)[0], /\(2\/3\): the assistant response was empty/);
+
+		// A finished answer clears the attempt budget again.
+		await pi.events.get("before_agent_start")({ prompt: STALL_RECOVERY_PROMPT }, ctx);
+		await pi.events.get("message_end")({ message: assistantMessage() }, ctx);
+		await pi.events.get("agent_end")({ messages: [] }, ctx);
+		assert.equal(pi.sent.length, 2);
+
+		await endInterruptedTurn(pi, ctx);
+		assert.equal(pi.sent.length, 3);
+		assert.match(notifications.at(-1)[0], /\(1\/3\)/);
+	} finally {
+		rmSync(cwd, { recursive: true, force: true });
+	}
+});
+
+test("stall recovery stops for cancelled turns, blocking errors, and its own attempt budget", async () => {
+	const cwd = mkdtempSync(join(tmpdir(), "pi-continue-stall-limits-"));
+	try {
+		const pi = createFakePi(cwd);
+		const notifications = [];
+		const ctx = createCommandContext(cwd, async () => undefined);
+		ctx.ui.notify = (message, type) => {
+			notifications.push([message, type]);
+		};
+		registerContinueExtension(pi);
+
+		await endInterruptedTurn(pi, ctx, assistantMessage("aborted"));
+		assert.deepEqual(pi.sent, [], "a cancelled turn belongs to the human");
+
+		await endInterruptedTurn(pi, ctx, interruptedAssistantMessage({
+			errorMessage: "401 Unauthorized: run /login openai-codex",
+		}));
+		assert.deepEqual(pi.sent, []);
+		assert.match(notifications.at(-1)[0], /did not resume: the provider reported an error that needs attention/);
+
+		for (let attempt = 0; attempt < 4; attempt += 1) await endInterruptedTurn(pi, ctx);
+		assert.equal(pi.sent.length, 3, "the attempt budget caps consecutive resumes");
+		assert.match(notifications.at(-1)[0], /stopped resuming after 3 attempts/);
+
+		// Human input hands control back and clears the budget.
+		await pi.events.get("input")({ text: "keep going", source: "interactive" }, ctx);
+		await endInterruptedTurn(pi, ctx);
+		assert.equal(pi.sent.length, 4);
+	} finally {
+		rmSync(cwd, { recursive: true, force: true });
+	}
+});
+
+test("stall recovery can be turned off and yields to pending human messages", async () => {
+	const cwd = mkdtempSync(join(tmpdir(), "pi-continue-stall-off-"));
+	try {
+		const pi = createFakePi(cwd);
+		const ctx = createCommandContext(cwd, async () => undefined);
+		registerContinueExtension(pi);
+
+		ctx.hasPendingMessages = () => true;
+		await endInterruptedTurn(pi, ctx);
+		assert.deepEqual(pi.sent, [], "queued human messages drive the next turn");
+		ctx.hasPendingMessages = () => false;
+
+		// An over-threshold context is compacted next, and that handoff resumes the work.
+		mkdirSync(join(cwd, ".pi"), { recursive: true });
+		writeFileSync(join(cwd, ".pi", "settings.json"), JSON.stringify({
+			compaction: { enabled: true, reserveTokens: 20, keepRecentTokens: 10 },
+		}), "utf8");
+		const usage = ctx.getContextUsage;
+		ctx.model = { ...ctx.model, contextWindow: 100 };
+		ctx.getContextUsage = () => ({ tokens: 130, percent: 130, contextWindow: 100 });
+		await endInterruptedTurn(pi, ctx);
+		assert.deepEqual(pi.sent, [], "the compaction handoff owns the resume for a full context");
+		ctx.getContextUsage = usage;
+
+		mkdirSync(join(cwd, ".pi", "extensions"), { recursive: true });
+		writeFileSync(join(cwd, ".pi", "extensions", "pi-continue.json"), JSON.stringify({
+			stallRecoveryEnabled: false,
+		}), "utf8");
+		await endInterruptedTurn(pi, ctx);
+		assert.deepEqual(pi.sent, []);
+	} finally {
+		rmSync(cwd, { recursive: true, force: true });
+	}
+});
+
 test("Pi's own over-threshold compaction is adopted as a package handoff", async () => {
 	const cwd = mkdtempSync(join(tmpdir(), "pi-continue-adopt-"));
 	const faux = fauxProvider();
@@ -963,6 +1079,11 @@ test("below-threshold, manual, and opted-out compactions keep Pi's own summarize
 		const pi = createFakePi(cwd);
 		const ctx = createCommandContext(cwd, async () => undefined);
 		ctx.model = { ...ctx.model, contextWindow: 100 };
+		// This case is about adoption only; interrupted-turn recovery has its own tests.
+		mkdirSync(join(cwd, ".pi", "extensions"), { recursive: true });
+		writeFileSync(join(cwd, ".pi", "extensions", "pi-continue.json"), JSON.stringify({
+			stallRecoveryEnabled: false,
+		}), "utf8");
 		registerContinueExtension(pi);
 
 		// A /compact request reports its own trigger, with or without a finished turn.
@@ -974,6 +1095,12 @@ test("below-threshold, manual, and opted-out compactions keep Pi's own summarize
 		await completeAssistantTurn(pi, ctx);
 		assert.equal(await pi.events.get("session_before_compact")(overThresholdCompactionEvent("overflow"), ctx), undefined);
 
+		// A turn that produced no assistant response cannot inherit an earlier stop reason.
+		await completeAssistantTurn(pi, ctx);
+		await pi.events.get("before_agent_start")({ prompt: "do the work" }, ctx);
+		await pi.events.get("agent_end")({ messages: [] }, ctx);
+		assert.equal(await pi.events.get("session_before_compact")(overThresholdCompactionEvent(), ctx), undefined);
+
 		// New user input takes the checkpoint away from the finished turn.
 		await completeAssistantTurn(pi, ctx);
 		await pi.events.get("input")({ text: "keep going", source: "interactive" }, ctx);
@@ -983,8 +1110,8 @@ test("below-threshold, manual, and opted-out compactions keep Pi's own summarize
 		await completeAssistantTurn(pi, ctx);
 		assert.equal(await pi.events.get("session_before_compact")(compactionEvent({}, [], "threshold"), ctx), undefined);
 
-		mkdirSync(join(cwd, ".pi", "extensions"), { recursive: true });
 		writeFileSync(join(cwd, ".pi", "extensions", "pi-continue.json"), JSON.stringify({
+			stallRecoveryEnabled: false,
 			adoptNativeCompaction: false,
 		}), "utf8");
 		assert.equal(await pi.events.get("session_before_compact")(overThresholdCompactionEvent(), ctx), undefined);

@@ -112,6 +112,20 @@ A model's context window and maximum output budget are independent. `pi-continue
 
 A complete ledger is still read when the model wraps it in Markdown fences, reasoning tags, or surrounding prose, while a response carrying competing artifacts fails closed. When the first response is not usable, one retry runs with an explicit format reminder and reasoning disabled, so an answer that spent the output budget on reasoning tokens gets a second, full budget for the artifact. If modeled Continuation Ledger creation still fails, or if Pi reports native/invalid/mismatched compaction proof for an active continuation, `pi-continue` stops before resuming and writes no guessed continuation artifact or agent guide. Run `/continue status`, inspect the failure, use `/continue preview` after prompt or config changes, fix the model/auth/context issue, then retry when Pi is idle.
 
+## Interrupted turns
+
+Some request failures end a Pi run silently: the assistant stops mid-task with no answer and no visible error. With `stallRecoveryEnabled` (the default), `pi-continue` restarts that work in the same session with a short resume request instead of leaving the run stopped.
+
+It resumes a turn that ended on a provider error Pi could not retry, hit the output token limit, stopped inside an unfinished tool loop, returned an empty response, or produced no assistant response at all.
+
+It stays out of the way when:
+
+- you cancelled the turn, or messages are already queued for the next one
+- the failure is one a resume cannot fix: authentication, permission, quota, billing, rate-limit, and unavailable-model errors
+- `stallRecoveryMaxAttempts` consecutive resumes have already run without the assistant delivering an answer
+
+The attempt budget resets as soon as a turn finishes with an answer or you type something, so a stuck run is retried a bounded number of times rather than looped.
+
 ## Configuration
 
 Global package config:
@@ -140,6 +154,8 @@ Default package config:
   "agentGuideSyncMode": "off",
   "midRunGuardEnabled": true,
   "adoptNativeCompaction": true,
+  "stallRecoveryEnabled": true,
+  "stallRecoveryMaxAttempts": 3,
   "appendCompactionMetadata": false,
   "appendReadFileTags": false,
   "appendModifiedFileTags": true,
@@ -155,6 +171,8 @@ Common settings:
 | `enabled` | Turns package behavior on or off. |
 | `midRunGuardEnabled` | Enables automatic mid-run continuation. |
 | `adoptNativeCompaction` | `true` by default; owns the over-threshold compaction Pi starts right after a finished assistant turn, so end-of-turn automatic compaction also saves a Continuation Ledger and resumes. `/compact` requests, compaction while new user input is submitted, cancelled turns, and context-overflow recovery keep Pi's own summarizer. |
+| `stallRecoveryEnabled` | `true` by default; resumes a turn that stopped without finishing the work, unless the failure needs human attention. |
+| `stallRecoveryMaxAttempts` | Maximum consecutive resume attempts for interrupted turns; default `3`, and `0` disables the retries while keeping the setting explicit. |
 | `summarizerModel` | Uses the active Pi model with `"inherit"`, or a pinned `"provider/model"`. |
 | `reasoning` | Uses Pi's setting with `"inherit"`, or a model-supported thinking level. Unsupported levels are hidden in settings and clamped through Pi's `thinkingLevelMap`. |
 | `historyMaxTokens` | Optional requested history output-token budget; `null` uses Pi-derived default. The effective provider request is clamped to the summarizer model's positive max-output limit when known. |

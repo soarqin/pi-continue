@@ -266,6 +266,7 @@ export function renderStatus(
 		`- Agent guide writes: ${config.agentGuideSyncMode === "always" ? "full replacement only" : "off"}`,
 		`- Automatic mid-run continuation: ${config.midRunGuardEnabled ? "yes" : "no"}`,
 		`- Adopt Pi's over-threshold compaction: ${config.adoptNativeCompaction ? "yes" : "no"}`,
+		`- Resume interrupted turns: ${config.stallRecoveryEnabled ? `yes, up to ${config.stallRecoveryMaxAttempts} consecutive attempts` : "no"}`,
 		`- Append compaction metadata: ${config.appendCompactionMetadata ? "yes" : "no"}`,
 		`- Append read file tags: ${config.appendReadFileTags ? "yes" : "no"}`,
 		`- Append modified file tags: ${config.appendModifiedFileTags ? "yes" : "no"}`,

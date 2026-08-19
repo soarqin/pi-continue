@@ -6,6 +6,7 @@ All notable changes to `pi-continue` are documented here.
 
 ### Added
 
+- `stallRecoveryEnabled` (default `true`) and `stallRecoveryMaxAttempts` (default `3`) resume a turn that stopped without finishing the work — a provider error Pi could not retry, an output-limit cut, an unfinished tool loop, an empty response, or no assistant response at all. Cancelled turns, queued human messages, and failures that need attention (authentication, permission, quota, billing, rate limit, unavailable model) stop the run instead, and the attempt budget resets once a turn delivers an answer or the human types.
 - `adoptNativeCompaction` (default `true`) lets `pi-continue` own the over-threshold compaction Pi starts after a finished assistant turn, so end-of-turn automatic compaction also saves a Continuation Ledger and resumes the same session. Adoption requires Pi's own threshold trigger and the single checkpoint an ending turn opens: a `/compact` request, compaction while new user input is submitted, cancelled turns, and context-overflow recovery keep Pi's native summarizer, and an adopted checkpoint whose ledger cannot be built is handed back to Pi instead of cancelling the compaction. Set the key to `false` to keep every Pi-initiated compaction native.
 - `max` is now a selectable `reasoning` level, matching Pi's current thinking levels.
 
