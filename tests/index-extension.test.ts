@@ -925,12 +925,22 @@ async function completeAssistantTurn(pi, ctx) {
 	await pi.events.get("agent_end")({ messages: [] }, ctx);
 }
 
-test("Pi's own over-threshold compaction is adopted as a package handoff", async () => {
+test("Pi's own over-threshold compaction resumes after Pi leaves session_compact", async () => {
 	const cwd = mkdtempSync(join(tmpdir(), "pi-continue-adopt-"));
 	const faux = fauxProvider();
 	try {
 		faux.setResponses([fauxAssistantMessage(continuationArtifactJson())]);
 		const pi = createFakePi(cwd);
+		let compactionInProgress = false;
+		const runtimeErrors = [];
+		pi.sendUserMessage = (prompt, options) => {
+			if (compactionInProgress) {
+				runtimeErrors.push('Extension "<runtime>" error: Cannot submit a prompt while compaction is in progress. Wait for compaction to finish and retry.');
+				return;
+			}
+			pi.sent.push(prompt);
+			pi.sentOptions.push(options);
+		};
 		const ctx = createCommandContext(cwd, async () => undefined);
 		ctx.model = { ...faux.models[0], contextWindow: 100 };
 		ctx.modelRegistry.getProvider = () => faux.provider;
@@ -942,6 +952,7 @@ test("Pi's own over-threshold compaction is adopted as a package handoff", async
 		assert.equal(result.compaction.details.continuationEventId, "continue-1");
 		assert.equal(ctx.compactCount, 0, "Pi already owns the compaction operation");
 		assert.deepEqual(pi.sent, []);
+		compactionInProgress = true;
 		await pi.events.get("session_compact")({
 			fromExtension: true,
 			compactionEntry: {
@@ -950,6 +961,9 @@ test("Pi's own over-threshold compaction is adopted as a package handoff", async
 				details: result.compaction.details,
 			},
 		}, ctx);
+		compactionInProgress = false;
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		assert.deepEqual(runtimeErrors, []);
 		assert.deepEqual(pi.sent, [CONTINUATION_PROMPT]);
 		assert.match(readFileSync(continuationArtifactPath(cwd), "utf8"), /## Task\nContinue the task\./);
 	} finally {
