@@ -506,7 +506,11 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.notify("Agent guide unchanged; no full replacement was produced.", "info");
 		}
 		if (acceptedActiveProof && activeEventId) {
-			dispatchVerifiedContinuationResume(ctx, runtime, activeEventId);
+			if (runtime.latestEvent?.source === "adopted-compaction") {
+				setTimeout(() => dispatchVerifiedContinuationResume(ctx, runtime, activeEventId), 0);
+			} else {
+				dispatchVerifiedContinuationResume(ctx, runtime, activeEventId);
+			}
 		}
 	});
 
