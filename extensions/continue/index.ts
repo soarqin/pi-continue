@@ -178,6 +178,13 @@ export default function (pi: ExtensionAPI) {
 		updateWorkingVisuals(ctx, runtime, eventId, "pi-continue resume running");
 	});
 
+	pi.on("agent_start", async () => {
+		// Native retries do not emit before_agent_start. Their outcomes must not inherit
+		// an earlier run's answer or compaction checkpoint.
+		clearContinuationAdoptionCheckpoint(runtime);
+		beginContinuationTurn(runtime);
+	});
+
 	pi.on("message_start", async (event, ctx) => {
 		if (isContinuationPromptUserMessage(event.message, CONTINUATION_PROMPT)) {
 			const eventId = markAwaitingContinuationResumeStarted(runtime);
@@ -192,10 +199,12 @@ export default function (pi: ExtensionAPI) {
 		updateWorkingVisuals(ctx, runtime, eventId, "pi-continue resume running");
 	});
 
-	pi.on("input", async (_event, _ctx) => {
-		// The human is driving again: the next compaction belongs to that submission rather
-		// than to a finished turn, and earlier stall nudges no longer count against the budget.
-		noteContinuationUserInput(runtime);
+	pi.on("input", async (event, _ctx) => {
+		// Every submission owns its compaction, but automatic nudges must not reset
+		// their own retry budget as though the human had taken over.
+		clearContinuationAdoptionCheckpoint(runtime);
+		endedTurnOutcome = undefined;
+		if (event.source !== "extension") noteContinuationUserInput(runtime);
 	});
 
 	function isOverCompactionThreshold(ctx: ExtensionContext, projectRoot: string): boolean {
@@ -220,38 +229,37 @@ export default function (pi: ExtensionAPI) {
 		// A pending handoff or resume already owns what happens next.
 		return getActiveContinuationEventId(runtime) !== undefined
 			|| runtime.awaitingResumeEventId !== undefined
-			|| runtime.compactionRunning;
+			|| runtime.compactionRunning
+			|| compactionHandoffInFlight;
 	}
 
 	async function recoverStalledTurn(ctx: ExtensionContext): Promise<void> {
-		if (stallRecoveryInFlight || stallRecoveryOwnedElsewhere()) return;
+		if (sessionClosed || !ctx.isIdle() || stallRecoveryOwnedElsewhere()) return;
 		const decision = decideStallRecovery(runtime.turnOutcome);
 		if (decision.action === "settled") {
 			resetStallRecoveryAttempts(runtime);
 			return;
 		}
-		stallRecoveryInFlight = true;
-		try {
-			await sendStallRecoveryPrompt(ctx, decision);
-		} finally {
-			stallRecoveryInFlight = false;
-		}
+		await sendStallRecoveryPrompt(ctx, decision);
 	}
 
 	async function sendStallRecoveryPrompt(ctx: ExtensionContext, decision: StallRecoveryDecision): Promise<void> {
 		const inputSequenceAtStart = runtime.inputSequence;
+		const outcomeAtStart = runtime.turnOutcome;
 		const projectContext = await resolveProjectContext(pi, ctx.cwd, ctx.sessionManager.getSessionId());
 		const config = loadContinuationConfig(projectContext.projectRoot);
 		if (!config.enabled || !config.stallRecoveryEnabled) return;
-		// The human or a continuation handoff may have taken over while the config resolved.
-		if (runtime.inputSequence !== inputSequenceAtStart || stallRecoveryOwnedElsewhere()) return;
+		// Config resolution yields: new work, a newer answer, or shutdown invalidates
+		// this decision even when there was no human input or package-owned handoff.
+		if (sessionClosed || !ctx.isIdle() || runtime.turnOutcome !== outcomeAtStart
+			|| runtime.inputSequence !== inputSequenceAtStart || stallRecoveryOwnedElsewhere()) return;
 		if (decision.action !== "resume") {
 			resetStallRecoveryAttempts(runtime);
 			if (ctx.hasUI) ctx.ui.notify(`pi-continue did not resume: ${decision.reason}.`, "warning");
 			return;
 		}
-		// An over-threshold context is about to be compacted, and that handoff sends its own
-		// resume request. Nudging here would queue a second prompt for the same work.
+		// An over-threshold context needs compaction, not another provider request.
+		// A continuation handoff sends its own resume request.
 		if (isOverCompactionThreshold(ctx, projectContext.projectRoot)) return;
 		// Queued human messages drive the next turn themselves.
 		if (ctx.hasPendingMessages()) return;
@@ -279,8 +287,17 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
-	pi.on("agent_end", async (_event, ctx) => {
+	pi.on("agent_end", async () => {
 		openContinuationAdoptionCheckpoint(runtime);
+		endedTurnOutcome = runtime.turnOutcome;
+	});
+
+	pi.on("agent_settled", async (_event, ctx) => {
+		// agent_end precedes Pi's retry/compaction/queue processing. Only settled idle
+		// work can need a nudge; otherwise it would linger behind an already live run.
+		const outcome = endedTurnOutcome;
+		endedTurnOutcome = undefined;
+		if (sessionClosed || !ctx.isIdle() || outcome !== runtime.turnOutcome) return;
 		const settlement = failRunningAwaitingContinuationResume(runtime, "Continuation resume did not produce an assistant response.");
 		if (settlement) {
 			settleWorkingVisuals(ctx, runtime, settlement.eventId);
@@ -504,7 +521,8 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	let compactionHandoffInFlight = false;
-	let stallRecoveryInFlight = false;
+	let sessionClosed = false;
+	let endedTurnOutcome: ContinuationRuntimeState["turnOutcome"] | undefined;
 
 	pi.on("session_before_compact", async (event, ctx) => {
 		// One compaction at a time: a second operation entering while a handoff is being
@@ -608,6 +626,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
+		sessionClosed = true;
 		abandonActiveContinuationEvent(runtime, "Pi session shut down before continuation finished settling.");
 		pendingOutputWrites.clear();
 		clearWorkingVisuals(ctx, runtime);

@@ -12,6 +12,8 @@ All notable changes to `pi-continue` are documented here.
 
 ### Fixed
 
+- Stall recovery waits for `agent_settled` and rechecks idle state and the captured turn outcome before dispatch, instead of queuing a stale resume prompt while Pi is still retrying or continuing work. Shutdown cancels in-flight recovery checks, and native retries start with a fresh outcome.
+- Recovery nudges no longer reset their own consecutive-attempt budget through extension-sourced `input` events.
 - Automatic continuation no longer stops contributing after Pi's own threshold compaction wins a checkpoint; previously those compactions were saved natively with no ledger and no resume.
 - Read a complete Continuation Ledger through model presentation wrappers such as Markdown fences, reasoning tags, and surrounding prose; the artifact must still satisfy the full v4 contract, and a response carrying competing artifacts still fails closed.
 - Retried modeled Continuation Ledger synthesis once with an explicit format reminder and reasoning disabled, so responses that answered with prose or spent the output budget on reasoning tokens no longer cancel the handoff.

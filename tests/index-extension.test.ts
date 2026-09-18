@@ -580,7 +580,7 @@ test("settings dialog can edit the human handoff trigger", async () => {
 	}
 });
 
-test("agent_end settles only a started continuation resume failure", async () => {
+test("agent_settled settles only a started continuation resume failure", async () => {
 	const cwd = process.cwd();
 	const pi = createFakePi(cwd);
 	const ctx = createCommandContext(cwd, async () => undefined);
@@ -589,12 +589,18 @@ test("agent_end settles only a started continuation resume failure", async () =>
 	ctx.compactOptions.onComplete({});
 	await pi.events.get("session_compact")(ownedCompactionEvent(), ctx);
 	await pi.events.get("agent_end")({}, ctx);
-	assert.deepEqual(ctx.statusCalls, []);
+	await pi.events.get("agent_settled")({}, ctx);
+	assert.equal(ctx.workingMessages.at(-1), "pi-continue resuming this session");
 	await pi.events.get("before_agent_start")({ prompt: "unrelated prompt" }, ctx);
 	await pi.events.get("agent_end")({}, ctx);
-	assert.deepEqual(ctx.statusCalls, []);
+	await pi.events.get("agent_settled")({}, ctx);
+	assert.equal(ctx.workingMessages.at(-1), "pi-continue resuming this session");
 	await pi.events.get("before_agent_start")({ prompt: CONTINUATION_PROMPT }, ctx);
 	await pi.events.get("agent_end")({}, ctx);
+	assert.equal(ctx.workingMessages.at(-1), "pi-continue resume running");
+	await pi.events.get("agent_settled")({}, ctx);
+	assert.equal(ctx.workingMessages.at(-1), undefined);
+	assert.deepEqual(pi.sent, [CONTINUATION_PROMPT], "a failed handoff resume does not send a second nudge");
 	assert.deepEqual(ctx.statusCalls, []);
 });
 
@@ -935,9 +941,118 @@ function interruptedAssistantMessage(overrides = {}) {
 
 async function endInterruptedTurn(pi, ctx, message = interruptedAssistantMessage()) {
 	await pi.events.get("before_agent_start")({ prompt: "do the work" }, ctx);
+	ctx.isIdle = () => false;
+	await pi.events.get("agent_start")({}, ctx);
 	await pi.events.get("message_end")({ message }, ctx);
-	await pi.events.get("agent_end")({ messages: [] }, ctx);
+	await pi.events.get("agent_end")({ messages: [message] }, ctx);
+	ctx.isIdle = () => true;
+	await pi.events.get("agent_settled")({}, ctx);
 }
+
+test("stall recovery waits for native retries and continued tool work to settle", async () => {
+	const cwd = mkdtempSync(join(tmpdir(), "pi-continue-stall-retry-"));
+	try {
+		const pi = createFakePi(cwd);
+		const ctx = createCommandContext(cwd, async () => undefined);
+		registerContinueExtension(pi);
+		await pi.events.get("before_agent_start")({ prompt: "do the work" }, ctx);
+		ctx.isIdle = () => false;
+		await pi.events.get("message_end")({ message: interruptedAssistantMessage() }, ctx);
+		await pi.events.get("agent_end")({ messages: [] }, ctx);
+		assert.deepEqual(pi.sent, [], "agent_end precedes Pi's automatic retry, not session idle");
+
+		// Native retries start a new low-level run without before_agent_start.
+		await pi.events.get("agent_start")({}, ctx);
+		await pi.events.get("message_end")({ message: highUsageAssistantMessage() }, ctx);
+		await pi.events.get("message_end")({ message: toolResultMessage("still working") }, ctx);
+		assert.deepEqual(pi.sent, [], "a live tool loop needs no recovery prompt");
+		await pi.events.get("message_end")({ message: assistantMessage() }, ctx);
+		await pi.events.get("agent_end")({ messages: [] }, ctx);
+		ctx.isIdle = () => true;
+		await pi.events.get("agent_settled")({}, ctx);
+		assert.deepEqual(pi.sent, [], "a successful retry must not leave a follow-up nudge queued");
+
+		await endInterruptedTurn(pi, ctx);
+		assert.deepEqual(pi.sent, [STALL_RECOVERY_PROMPT], "an unrecovered failure still resumes after settling");
+		await pi.events.get("agent_settled")({}, ctx);
+		assert.equal(pi.sent.length, 1, "a settled outcome is consumed only once");
+
+		await pi.events.get("message_end")({ message: assistantMessage() }, ctx);
+		await pi.events.get("agent_end")({ messages: [] }, ctx);
+		await pi.events.get("agent_settled")({}, ctx);
+		await pi.events.get("agent_start")({}, ctx);
+		await pi.events.get("agent_end")({ messages: [] }, ctx);
+		await pi.events.get("agent_settled")({}, ctx);
+		assert.equal(pi.sent.length, 2, "a run with no assistant response must not inherit the earlier answer");
+	} finally {
+		rmSync(cwd, { recursive: true, force: true });
+	}
+});
+
+test("stall recovery discards a decision superseded while project context resolves", async () => {
+	const cwd = mkdtempSync(join(tmpdir(), "pi-continue-stall-stale-"));
+	try {
+		for (const supersededBy of ["busy", "new turn", "answer", "human input", "shutdown", "new failure"]) {
+			const pi = createFakePi(cwd);
+			const ctx = createCommandContext(cwd, async () => undefined);
+			const notifications = [];
+			ctx.ui.notify = (message) => notifications.push(message);
+			registerContinueExtension(pi);
+			await pi.events.get("before_agent_start")({ prompt: "do the work" }, ctx);
+			await pi.events.get("message_end")({ message: { ...assistantMessage(), content: [] } }, ctx);
+			await pi.events.get("agent_end")({ messages: [] }, ctx);
+			const started = Promise.withResolvers();
+			const release = Promise.withResolvers();
+			const originalExec = pi.exec;
+			pi.exec = async () => {
+				started.resolve();
+				await release.promise;
+				return { stdout: cwd, code: 0 };
+			};
+			const recovery = pi.events.get("agent_settled")({}, ctx);
+			await started.promise;
+			try {
+				if (supersededBy === "busy") ctx.isIdle = () => false;
+				if (supersededBy === "new turn") await pi.events.get("before_agent_start")({ prompt: "new work" }, ctx);
+				if (supersededBy === "answer") await pi.events.get("message_end")({ message: assistantMessage() }, ctx);
+				if (supersededBy === "human input") await pi.events.get("input")({ text: "stop", source: "interactive" }, ctx);
+				if (supersededBy === "shutdown") await pi.events.get("session_shutdown")({ reason: "reload" }, ctx);
+				if (supersededBy === "new failure") {
+					pi.exec = originalExec;
+					await endInterruptedTurn(pi, ctx);
+				}
+			} finally {
+				release.resolve();
+				await recovery;
+			}
+			assert.deepEqual(pi.sent, supersededBy === "new failure" ? [STALL_RECOVERY_PROMPT] : [], supersededBy);
+			assert.equal(notifications.length, supersededBy === "new failure" ? 1 : 0, supersededBy);
+		}
+	} finally {
+		rmSync(cwd, { recursive: true, force: true });
+	}
+});
+
+test("stall recovery skips an outcome superseded before settlement", async () => {
+	const cwd = mkdtempSync(join(tmpdir(), "pi-continue-stall-busy-"));
+	try {
+		for (const supersededBy of ["busy", "preflight", "interactive", "extension"]) {
+			const pi = createFakePi(cwd);
+			const ctx = createCommandContext(cwd, async () => undefined);
+			registerContinueExtension(pi);
+			await pi.events.get("message_end")({ message: { ...assistantMessage(), content: [] } }, ctx);
+			await pi.events.get("agent_end")({ messages: [] }, ctx);
+			if (supersededBy === "busy") ctx.isIdle = () => false;
+			// Pi can still report idle during another prompt's async preflight.
+			else if (supersededBy === "preflight") await pi.events.get("before_agent_start")({ prompt: "new work" }, ctx);
+			else await pi.events.get("input")({ text: "new work", source: supersededBy }, ctx);
+			await pi.events.get("agent_settled")({}, ctx);
+			assert.deepEqual(pi.sent, [], supersededBy);
+		}
+	} finally {
+		rmSync(cwd, { recursive: true, force: true });
+	}
+});
 
 test("an interrupted turn is resumed until the run makes progress", async () => {
 	const cwd = mkdtempSync(join(tmpdir(), "pi-continue-stall-"));
@@ -963,6 +1078,7 @@ test("an interrupted turn is resumed until the run makes progress", async () => 
 		await pi.events.get("before_agent_start")({ prompt: STALL_RECOVERY_PROMPT }, ctx);
 		await pi.events.get("message_end")({ message: assistantMessage() }, ctx);
 		await pi.events.get("agent_end")({ messages: [] }, ctx);
+		await pi.events.get("agent_settled")({}, ctx);
 		assert.equal(pi.sent.length, 2);
 
 		await endInterruptedTurn(pi, ctx);
@@ -993,7 +1109,11 @@ test("stall recovery stops for cancelled turns, blocking errors, and its own att
 		assert.deepEqual(pi.sent, []);
 		assert.match(notifications.at(-1)[0], /did not resume: the provider reported an error that needs attention/);
 
-		for (let attempt = 0; attempt < 4; attempt += 1) await endInterruptedTurn(pi, ctx);
+		for (let attempt = 0; attempt < 4; attempt += 1) {
+			// sendUserMessage also emits input; automatic nudges are not human takeovers.
+			if (attempt > 0) await pi.events.get("input")({ text: STALL_RECOVERY_PROMPT, source: "extension" }, ctx);
+			await endInterruptedTurn(pi, ctx);
+		}
 		assert.equal(pi.sent.length, 3, "the attempt budget caps consecutive resumes");
 		assert.match(notifications.at(-1)[0], /stopped resuming after 3 attempts/);
 

@@ -116,7 +116,7 @@ A complete ledger is still read when the model wraps it in Markdown fences, reas
 
 Some request failures end a Pi run silently: the assistant stops mid-task with no answer and no visible error. With `stallRecoveryEnabled` (the default), `pi-continue` restarts that work in the same session with a short resume request instead of leaving the run stopped.
 
-It resumes a turn that ended on a provider error Pi could not retry, hit the output token limit, stopped inside an unfinished tool loop, returned an empty response, or produced no assistant response at all.
+It resumes a turn that ended on a provider error Pi could not retry, hit the output token limit, stopped inside an unfinished tool loop, returned an empty response, or produced no assistant response at all. Recovery waits for Pi's `agent_settled` event and checks that the session is still idle, rather than queuing a nudge at `agent_end` while Pi may still retry, compact, or continue queued work. If new work starts while recovery resolves the project configuration, the stale nudge is discarded.
 
 It stays out of the way when:
 
@@ -124,7 +124,7 @@ It stays out of the way when:
 - the failure is one a resume cannot fix: authentication, permission, quota, billing, rate-limit, and unavailable-model errors
 - `stallRecoveryMaxAttempts` consecutive resumes have already run without the assistant delivering an answer
 
-The attempt budget resets as soon as a turn finishes with an answer or you type something, so a stuck run is retried a bounded number of times rather than looped.
+The attempt budget resets as soon as a turn finishes with an answer or you type something, so a stuck run is retried a bounded number of times rather than looped. Extension-injected messages, including recovery nudges themselves, do not reset that budget.
 
 ## Configuration
 
